@@ -3,6 +3,8 @@ const builtin = @import("builtin");
 
 const log = std.log.scoped(.clap);
 
+const Backlink = std.SinglyLinkedList([]const u8);
+
 inline fn strcmp(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
@@ -22,17 +24,23 @@ pub const Command = struct {
     params: []const Param = &[_]Param{},
     subcommands: []const Command = &[_]Command{},
 
-    /// the args list does not contain program name
     /// this method is recursive to parse subcommand
-    /// return null if the user input does not allow the program to continue
-    pub fn parse_from_str(comptime self: *const Command, args: []const [:0]const u8) !?DeriveCommand(self) {
+    /// backlink - link to parent command name
+    fn parseFromStrInner(
+        comptime self: *const Command,
+        args: []const [:0]const u8,
+        backlink: *Backlink,
+    ) !?DeriveCommand(self) {
         const CommandData = DeriveCommand(self);
         var command_data: CommandData = undefined;
         command_data.subcommand = null;
 
-        if (args.len == 0) {
+        var node = Backlink.Node{ .data = self.name };
+        backlink.prepend(&node);
+
+        if (args.len == 0 or (args.len == 1 and (strcmp(args[0], "--help") or strcmp(args[0], "-h")))) {
             log.debug("no arguments provided, printing help", .{});
-            self.printHelp();
+            try self.printHelp(backlink);
             return null;
         }
 
@@ -40,7 +48,7 @@ pub const Command = struct {
         inline for (self.subcommands) |*command| {
             // only the first argument can be treated as subcommand
             if (strcmp(args[0], command.name)) {
-                const subcommand_data = try command.parse_from_str(args[1..]);
+                const subcommand_data = try command.parseFromStrInner(args[1..], backlink);
                 if (subcommand_data) |sub| {
                     command_data.subcommand = @unionInit(@typeInfo(@TypeOf(command_data.subcommand)).Optional.child, command.name, sub);
                 } else {
@@ -57,6 +65,7 @@ pub const Command = struct {
             var i: usize = 0;
             var field_set: bool = false;
             while (i < args.len) : (i += 1) {
+                std.debug.print("checking {s}\n", .{args[i]});
                 if (strcmp(args[i], "--help") or strcmp(args[i], "-h")) {
                     self.printHelp();
                     return null;
@@ -96,21 +105,55 @@ pub const Command = struct {
         return command_data;
     }
 
-    pub fn parse(comptime self: *const Command, allocator: std.mem.Allocator) !?DeriveCommand(self) {
-        const os_args = try std.process.argsAlloc(allocator);
-        defer std.process.argsFree(allocator, os_args[1..]);
-        return self.parse_from_str(os_args);
+    /// the first argument should be the program name
+    /// return null if the user input does not allow the program to continue
+    pub fn parseFromStr(comptime self: *const Command, args: []const [:0]const u8) !?DeriveCommand(self) {
+        var backlink = Backlink{};
+        return self.parseFromStrInner(args, &backlink);
     }
 
-    fn printHelp(comptime self: *const Command) void {
-        std.debug.print("{s}\n", .{self.name});
-        std.debug.print("{s}\n", .{self.about});
-        std.debug.print("USAGE:\n", .{});
-        inline for (self.params) |arg| {
-            std.debug.print("  --{s}\t{s}\n", .{ arg.name, arg.help });
+    pub fn parse(comptime self: *const Command, allocator: std.mem.Allocator) !?DeriveCommand(self) {
+        const os_args = try std.process.argsAlloc(allocator);
+        defer std.process.argsFree(allocator, os_args);
+        return self.parseFromStr(os_args[1..]);
+    }
+
+    fn printHelp(comptime self: *const Command, backlink: *const Backlink) !void {
+        var buffered_writer = std.io.bufferedWriter(std.io.getStdOut().writer());
+        var writer = buffered_writer.writer();
+        try writer.print("{s}\n\n", .{self.about});
+
+        try writer.print("Usage: ", .{});
+
+        if (backlink.first) |node| {
+            try backtrace_print(node, writer);
         }
+        try writer.print("\n\n", .{});
+
+        try self.printCommandHelp(&writer);
+        try buffered_writer.flush();
+    }
+
+    fn printCommandHelp(comptime self: *const Command, writer: anytype) !void {
+        try writer.print("Commands:\n", .{});
+        inline for (self.subcommands) |command| {
+            try writer.print("  {s}\t{s}\n\n", .{ command.name, command.about });
+        }
+        try writer.print("Options:\n", .{});
+        try writer.print("  -h, --help\tPrint this help\n", .{});
+        inline for (self.params) |arg| {
+            try writer.print("  --{s}\t{s}\n", .{ arg.name, arg.help });
+        }
+        try writer.print("\n", .{});
     }
 };
+
+fn backtrace_print(node: *const Backlink.Node, writer: anytype) !void {
+    if (node.next) |n| {
+        try backtrace_print(n, writer);
+    }
+    try writer.print("{s} ", .{node.data});
+}
 
 /// if neither long nor short is set, it's a positional argument
 pub const Param = struct {
@@ -247,7 +290,7 @@ test "mandatory parameters" {
             },
         },
     };
-    const matches = try command.parse_from_str(&[_][:0]const u8{
+    const matches = try command.parseFromStr(&[_][:0]const u8{
         "--width",
         "100",
         "--height",
@@ -279,7 +322,7 @@ test "optional parameters" {
             },
         },
     };
-    const matches = try command.parse_from_str(&[_][:0]const u8{
+    const matches = try command.parseFromStr(&[_][:0]const u8{
         "--width",
         "100",
     });
@@ -338,7 +381,7 @@ test "subcommand" {
         },
     };
 
-    const matches_1 = try command.parse_from_str(&[_][:0]const u8{
+    const matches_1 = try command.parseFromStr(&[_][:0]const u8{
         "start",
         "--quiet",
     });
